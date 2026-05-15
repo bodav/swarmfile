@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# swarmfile — helmfile-style deploy manager for Docker Swarm
+# Usage: swarmfile [diff|apply] [flags]
+set -euo pipefail
+
+# ─── Color helpers ────────────────────────────────────────────────────────────
+# Respects NO_COLOR env var and non-TTY stdout
+_setup_colors() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RED=$'\033[0;31m'
+    GREEN=$'\033[0;32m'
+    YELLOW=$'\033[1;33m'
+    CYAN=$'\033[0;36m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    RESET=$'\033[0m'
+  else
+    RED='' GREEN='' YELLOW='' CYAN='' BOLD='' DIM='' RESET=''
+  fi
+}
+_setup_colors
+
+info()    { printf "${CYAN}[swarmfile]${RESET} %s\n"  "$*"; }
+ok()      { printf "${GREEN}[swarmfile]${RESET} %s\n" "$*"; }
+warn()    { printf "${YELLOW}[swarmfile]${RESET} %s\n" "$*" >&2; }
+error()   { printf "${RED}[swarmfile] ERROR:${RESET} %s\n" "$*" >&2; }
+fatal()   { error "$*"; exit 1; }
+
+# ─── Dependency checks ────────────────────────────────────────────────────────
+check_deps() {
+  local missing=()
+  command -v docker >/dev/null 2>&1 || missing+=("docker")
+  command -v yq     >/dev/null 2>&1 || missing+=("yq (https://github.com/mikefarah/yq)")
+  if (( ${#missing[@]} > 0 )); then
+    fatal "Missing required tools: ${missing[*]}"
+  fi
+
+  # Require mikefarah/yq (v4+), not the Python yq
+  local yq_version
+  yq_version=$(yq --version 2>&1)
+  if ! echo "$yq_version" | grep -qE 'version v?4\.|mikefarah'; then
+    warn "yq may not be mikefarah/yq v4. Unexpected output: ${yq_version}"
+    warn "Install from: https://github.com/mikefarah/yq/releases"
+  fi
+}
+
+# ─── Docker context wrapper ───────────────────────────────────────────────────
+# Usage: docker_cmd [--context CTX] <args...>
+# Passes --context only when a context is set, avoiding mutating global context.
+docker_cmd() {
+  local ctx="${CURRENT_CONTEXT:-}"
+  if [[ -n "$ctx" ]]; then
+    docker --context "$ctx" "$@"
+  else
+    docker "$@"
+  fi
+}
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+SWARMFILE="./swarmfile.yaml"
+GLOBAL_CONTEXT=""
+SELECTOR=""
+INTERACTIVE=false
+COMMAND=""
+
+usage() {
+  cat <<EOF
+${BOLD}swarmfile${RESET} — helmfile-style deploy manager for Docker Swarm
+
+${BOLD}USAGE${RESET}
+  swarmfile <command> [flags]
+
+${BOLD}COMMANDS${RESET}
+  init    Bootstrap a swarmfile.yaml in the current directory
+  diff    Show changes between swarmfile.yaml and running Docker stacks
+  apply   Apply changes; use --interactive to confirm before each deployment
+
+${BOLD}FLAGS${RESET}
+  -f, --file FILE          Path to swarmfile.yaml (default: ./swarmfile.yaml)
+      --context CONTEXT    Override Docker context for all stacks
+  -l, --selector LABEL     Filter stacks by label (e.g. tier=frontend)
+  -i, --interactive        Prompt for confirmation before each deployment (apply only)
+  -h, --help               Show this help message
+
+${BOLD}SWARMFILE.YAML EXAMPLE${RESET}
+  defaults:
+    context: my-swarm-context
+
+  stacks:
+    - name: myapp
+      compose:
+        - docker-compose.yml
+        - docker-compose.prod.yml
+      context: override-context   # optional per-stack override
+      env_files:
+        - .env
+      labels:
+        tier: frontend
+
+${BOLD}EXIT CODES${RESET}
+  0  No changes (diff) or apply succeeded
+  1  Changes detected (diff) or error occurred
+  2  Usage error
+EOF
+}
+
+parse_args() {
+  while (( $# > 0 )); do
+    case "$1" in
+      init|diff|apply)
+        if [[ -n "$COMMAND" ]]; then
+          fatal "Multiple commands specified: '${COMMAND}' and '${1}'"
+        fi
+        COMMAND="$1"
+        shift
+        ;;
+      -f|--file)
+        [[ $# -lt 2 ]] && fatal "--file requires an argument"
+        SWARMFILE="$2"; shift 2
+        ;;
+      --context)
+        [[ $# -lt 2 ]] && fatal "--context requires an argument"
+        GLOBAL_CONTEXT="$2"; shift 2
+        ;;
+      -l|--selector)
+        [[ $# -lt 2 ]] && fatal "--selector requires an argument"
+        SELECTOR="$2"; shift 2
+        ;;
+      -i|--interactive)
+        INTERACTIVE=true; shift
+        ;;
+      -h|--help)
+        usage; exit 0
+        ;;
+      *)
+        fatal "Unknown argument: $1"
+        ;;
+    esac
+  done
+
+  if [[ -z "$COMMAND" ]]; then
+    usage; exit 2
+  fi
+}
+
+# ─── swarmfile.yaml loading ───────────────────────────────────────────────────
+load_swarmfile() {
+  if [[ ! -f "$SWARMFILE" ]]; then
+    fatal "swarmfile.yaml not found: ${SWARMFILE}"
+  fi
+
+  # Validate top-level 'stacks' key exists and is a non-empty array
+  local stack_count
+  stack_count=$(yq '.stacks | length' "$SWARMFILE" 2>/dev/null || echo "0")
+  if [[ "$stack_count" == "0" || "$stack_count" == "null" ]]; then
+    fatal "'stacks' key missing or empty in ${SWARMFILE}"
+  fi
+
+  # Load global default context if not overridden on CLI
+  if [[ -z "$GLOBAL_CONTEXT" ]]; then
+    GLOBAL_CONTEXT=$(yq '.defaults.context // ""' "$SWARMFILE")
+  fi
+}
+
+# ─── Stack filtering via --selector ──────────────────────────────────────────
+# Returns 0 if the stack at index $1 matches selector $SELECTOR, 1 otherwise.
+stack_matches_selector() {
+  local idx="$1"
+  if [[ -z "$SELECTOR" ]]; then
+    return 0
+  fi
+
+  local sel_key sel_val
+  sel_key="${SELECTOR%%=*}"
+  sel_val="${SELECTOR#*=}"
+
+  local stack_val
+  stack_val=$(yq ".stacks[${idx}].labels.${sel_key} // \"\"" "$SWARMFILE")
+  [[ "$stack_val" == "$sel_val" ]]
+}
+
+# ─── Diff helpers ─────────────────────────────────────────────────────────────
+
+# Render the desired compose config to a temp file.
+# Sets RENDERED_FILE (caller must rm on exit).
+render_compose() {
+  local context="$1"; shift  # may be empty
+  local compose_files=("$@")
+
+  RENDERED_FILE=$(mktemp /tmp/swarmfile_rendered.XXXXXX.yml)
+
+  # Build compose -f args
+  local compose_args=()
+  for f in "${compose_files[@]}"; do
+    compose_args+=("-f" "$f")
+  done
+
+  CURRENT_CONTEXT="$context" \
+    docker_cmd compose "${compose_args[@]}" config --no-interpolate=false \
+    > "$RENDERED_FILE" 2>/dev/null \
+    || fatal "Failed to render compose config for files: ${compose_files[*]}"
+}
+
+# Compare a single service's desired state (from rendered YAML) vs live Docker.
+# Prints colored diff lines. Returns 0 if changed, 1 if unchanged.
+diff_service() {
+  local stack_name="$1"
+  local svc_name="$2"      # plain service name (e.g. "web")
+  local context="$3"
+
+  local full_svc="${stack_name}_${svc_name}"
+  local changed=false
+  local output=()
+
+  # ── Image ──
+  local desired_image
+  desired_image=$(yq ".services.${svc_name}.image // \"\"" "$RENDERED_FILE")
+
+  local current_image
+  current_image=$(CURRENT_CONTEXT="$context" docker_cmd service inspect "$full_svc" \
+    --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null || echo "__missing__")
+
+  # Docker appends a content digest; strip it for comparison
+  local current_image_tag="${current_image%%@sha256:*}"
+
+  if [[ "$current_image" == "__missing__" ]]; then
+    : # new service; handled at caller level
+  elif [[ -n "$desired_image" && "$desired_image" != "$current_image_tag" ]]; then
+    output+=("    ${DIM}image:${RESET}    ${RED}- ${current_image_tag}${RESET}")
+    output+=("              ${GREEN}+ ${desired_image}${RESET}")
+    changed=true
+  fi
+
+  # ── Replicas ──
+  local desired_replicas
+  desired_replicas=$(yq ".services.${svc_name}.deploy.replicas // 1" "$RENDERED_FILE")
+
+  local current_replicas
+  current_replicas=$(CURRENT_CONTEXT="$context" docker_cmd service inspect "$full_svc" \
+    --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}global{{end}}' \
+    2>/dev/null || echo "__missing__")
+
+  if [[ "$current_replicas" != "__missing__" && \
+        "$desired_replicas" != "$current_replicas" ]]; then
+    output+=("    ${DIM}replicas:${RESET} ${RED}- ${current_replicas}${RESET}  ${GREEN}+ ${desired_replicas}${RESET}")
+    changed=true
+  fi
+
+  # ── Environment variables ──
+  # Collect desired env as sorted list
+  local desired_env=()
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == "null" ]] && continue
+    desired_env+=("$line")
+  done < <(yq ".services.${svc_name}.environment | to_entries | .[] | .key + \"=\" + .value" \
+    "$RENDERED_FILE" 2>/dev/null || true)
+
+  local current_env=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    current_env+=("$line")
+  done < <(CURRENT_CONTEXT="$context" docker_cmd service inspect "$full_svc" \
+    --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+    2>/dev/null || true)
+
+  # Compare sorted sets
+  local added_env=() removed_env=()
+  local IFS=$'\n'
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    added_env+=("$line")
+  done < <(comm -23 \
+    <(printf '%s\n' "${desired_env[@]+"${desired_env[@]}"}" | sort) \
+    <(printf '%s\n' "${current_env[@]+"${current_env[@]}"}" | sort))
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    removed_env+=("$line")
+  done < <(comm -13 \
+    <(printf '%s\n' "${desired_env[@]+"${desired_env[@]}"}" | sort) \
+    <(printf '%s\n' "${current_env[@]+"${current_env[@]}"}" | sort))
+
+  if (( ${#added_env[@]} > 0 || ${#removed_env[@]} > 0 )); then
+    for e in "${added_env[@]+"${added_env[@]}"}";   do
+      output+=("    ${DIM}env:${RESET}      ${GREEN}+ ${e}${RESET}")
+    done
+    for e in "${removed_env[@]+"${removed_env[@]}"}"; do
+      output+=("    ${DIM}env:${RESET}      ${RED}- ${e}${RESET}")
+    done
+    changed=true
+  fi
+
+  if $changed; then
+    printf "${YELLOW}  ~ %s${RESET}\n" "$svc_name"
+    printf '%s\n' "${output[@]}"
+    return 0
+  else
+    printf "${DIM}  = %s${RESET}\n" "$svc_name"
+    return 1
+  fi
+}
+
+# Core per-stack diff.
+# Returns 0 if changes detected, 1 if no changes.
+stack_diff() {
+  local stack_name="$1"
+  local context="$2"; shift 2
+  local compose_files=("$@")
+
+  printf "\n${BOLD}Stack: %s${RESET}\n" "$stack_name"
+
+  # Render desired compose config
+  render_compose "$context" "${compose_files[@]}"
+  # shellcheck disable=SC2064
+  trap "rm -f '${RENDERED_FILE}'" RETURN
+
+  # Desired services
+  local desired_services=()
+  while IFS= read -r svc; do
+    [[ -z "$svc" || "$svc" == "null" ]] && continue
+    desired_services+=("$svc")
+  done < <(yq '.services | keys | .[]' "$RENDERED_FILE" 2>/dev/null || true)
+
+  if (( ${#desired_services[@]} == 0 )); then
+    warn "No services found in rendered compose for stack '${stack_name}'"
+    return 1
+  fi
+
+  # Check if stack already exists
+  local existing_stacks
+  existing_stacks=$(docker_cmd stack ls --format '{{.Name}}' 2>/dev/null || echo "")
+
+  local stack_exists=false
+  if echo "$existing_stacks" | grep -qx "$stack_name"; then
+    stack_exists=true
+  fi
+
+  if ! $stack_exists; then
+    printf "${GREEN}  + NEW stack — services to be created:${RESET}\n"
+    for svc in "${desired_services[@]}"; do
+      local image
+      image=$(yq ".services.${svc}.image // \"(build)\"" "$RENDERED_FILE")
+      printf "${GREEN}    + %s  %s${RESET}\n" "$svc" "$image"
+    done
+    return 0
+  fi
+
+  # Get currently running services for this stack (strip stack prefix)
+  local current_services=()
+  while IFS= read -r full_svc; do
+    [[ -z "$full_svc" ]] && continue
+    current_services+=("${full_svc#"${stack_name}_"}")
+  done < <(docker_cmd stack services "$stack_name" --format '{{.Name}}' 2>/dev/null || true)
+
+  local any_changes=false
+
+  # New and changed services
+  for svc in "${desired_services[@]}"; do
+    local is_current=false
+    for cur in "${current_services[@]+"${current_services[@]}"}"; do
+      [[ "$cur" == "$svc" ]] && is_current=true && break
+    done
+
+    if ! $is_current; then
+      local image
+      image=$(yq ".services.${svc}.image // \"(build)\"" "$RENDERED_FILE")
+      printf "${GREEN}  + %s  %s  (new service)${RESET}\n" "$svc" "$image"
+      any_changes=true
+    else
+      if diff_service "$stack_name" "$svc" "$context"; then
+        any_changes=true
+      fi
+    fi
+  done
+
+  # Removed services (will be pruned on apply)
+  for cur in "${current_services[@]+"${current_services[@]}"}"; do
+    local still_desired=false
+    for svc in "${desired_services[@]}"; do
+      [[ "$svc" == "$cur" ]] && still_desired=true && break
+    done
+    if ! $still_desired; then
+      printf "${RED}  - %s  (will be removed with --prune)${RESET}\n" "$cur"
+      any_changes=true
+    fi
+  done
+
+  if $any_changes; then
+    return 0
+  else
+    printf "${DIM}  (no changes)${RESET}\n"
+    return 1
+  fi
+}
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_diff() {
+  local stack_count
+  stack_count=$(yq '.stacks | length' "$SWARMFILE")
+  local any_changes=false
+
+  for (( i=0; i<stack_count; i++ )); do
+    stack_matches_selector "$i" || continue
+
+    local name context
+    name=$(yq ".stacks[${i}].name" "$SWARMFILE")
+    context=$(yq ".stacks[${i}].context // \"\"" "$SWARMFILE")
+    [[ -z "$context" ]] && context="$GLOBAL_CONTEXT"
+    CURRENT_CONTEXT="$context"
+
+    # Build compose files array
+    local compose_files=()
+    local cf_count
+    cf_count=$(yq ".stacks[${i}].compose | length" "$SWARMFILE")
+    for (( j=0; j<cf_count; j++ )); do
+      compose_files+=("$(yq ".stacks[${i}].compose[${j}]" "$SWARMFILE")")
+    done
+
+    if (( ${#compose_files[@]} == 0 )); then
+      warn "Stack '${name}': no compose files specified, skipping"
+      continue
+    fi
+
+    if stack_diff "$name" "$context" "${compose_files[@]}"; then
+      any_changes=true
+    fi
+  done
+
+  echo ""
+  if $any_changes; then
+    info "Changes detected."
+    return 1
+  else
+    ok "All stacks up to date."
+    return 0
+  fi
+}
+
+deploy_stack() {
+  local stack_name="$1"
+  local context="$2"; shift 2
+  local compose_files=("$@")
+
+  local compose_args=()
+  for f in "${compose_files[@]}"; do
+    compose_args+=("-c" "$f")
+  done
+
+  info "Deploying stack '${stack_name}'..."
+  CURRENT_CONTEXT="$context" \
+    docker_cmd stack deploy "${compose_args[@]}" \
+      --prune \
+      --with-registry-auth \
+      "$stack_name"
+  ok "Stack '${stack_name}' deployed."
+}
+
+cmd_apply() {
+  local stack_count
+  stack_count=$(yq '.stacks | length' "$SWARMFILE")
+
+  for (( i=0; i<stack_count; i++ )); do
+    stack_matches_selector "$i" || continue
+
+    local name context
+    name=$(yq ".stacks[${i}].name" "$SWARMFILE")
+    context=$(yq ".stacks[${i}].context // \"\"" "$SWARMFILE")
+    [[ -z "$context" ]] && context="$GLOBAL_CONTEXT"
+    CURRENT_CONTEXT="$context"
+
+    # Build compose files array
+    local compose_files=()
+    local cf_count
+    cf_count=$(yq ".stacks[${i}].compose | length" "$SWARMFILE")
+    for (( j=0; j<cf_count; j++ )); do
+      compose_files+=("$(yq ".stacks[${i}].compose[${j}]" "$SWARMFILE")")
+    done
+
+    if (( ${#compose_files[@]} == 0 )); then
+      warn "Stack '${name}': no compose files specified, skipping"
+      continue
+    fi
+
+    # Run diff to show what will change and decide whether to deploy
+    local has_changes=false
+    if stack_diff "$name" "$context" "${compose_files[@]}"; then
+      has_changes=true
+    fi
+
+    if ! $has_changes; then
+      printf "${DIM}  Skipping '${name}' — no changes.${RESET}\n"
+      continue
+    fi
+
+    if $INTERACTIVE; then
+      printf "\n${BOLD}Deploy stack '${name}'? [y/N]${RESET} "
+      local answer
+      read -r answer
+      if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        warn "Skipping '${name}'."
+        continue
+      fi
+    fi
+
+    deploy_stack "$name" "$context" "${compose_files[@]}"
+  done
+
+  echo ""
+  ok "Apply complete."
+}
+
+# ─── Init ─────────────────────────────────────────────────────────────────────
+cmd_init() {
+  if [[ -e "$SWARMFILE" ]]; then
+    fatal "${SWARMFILE} already exists. Remove it first or use --file to specify a different path."
+  fi
+
+  # Derive a sensible stack name from the current directory
+  local stack_name
+  stack_name=$(basename "$(pwd)")
+  # Sanitise: lowercase, replace non-alphanumeric/dash with dash
+  stack_name=$(printf '%s' "$stack_name" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]-' '-' | sed 's/-*$//')
+
+  # Detect current Docker context (best-effort; docker may not be installed yet)
+  local detected_context=""
+  if command -v docker >/dev/null 2>&1; then
+    detected_context=$(docker context show 2>/dev/null || true)
+    # Ignore the default context — not useful to hard-code it
+    [[ "$detected_context" == "default" ]] && detected_context=""
+  fi
+
+  # Detect compose files in the current directory (in preference order)
+  local detected_compose="docker-compose.yml"
+  for candidate in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    if [[ -f "$candidate" ]]; then
+      detected_compose="$candidate"
+      break
+    fi
+  done
+
+  # Build the defaults block only when a non-default context was found
+  local defaults_block=""
+  if [[ -n "$detected_context" ]]; then
+    defaults_block="defaults:\n  context: ${detected_context}\n\n"
+  else
+    defaults_block="# defaults:\n#   context: my-swarm-context  # optional: default Docker context\n\n"
+  fi
+
+  # Write the file
+  printf '%b' "${defaults_block}" > "$SWARMFILE"
+  cat >> "$SWARMFILE" <<EOF
+stacks:
+  - name: ${stack_name}
+    compose:
+      - ${detected_compose}
+    # context: override-context   # optional per-stack Docker context override
+    # labels:
+    #   tier: frontend            # used with --selector tier=frontend
+EOF
+
+  ok "Created ${SWARMFILE}"
+  printf '\n'
+  cat "$SWARMFILE"
+}
+
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+
+  # init only needs the target file path — skip dep checks and file loading
+  if [[ "$COMMAND" == "init" ]]; then
+    cmd_init
+    return
+  fi
+
+  check_deps
+  load_swarmfile
+
+  case "$COMMAND" in
+    diff)  cmd_diff  ;;
+    apply) cmd_apply ;;
+  esac
+}
+
+main "$@"
