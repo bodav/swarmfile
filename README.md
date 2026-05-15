@@ -23,7 +23,7 @@ Stack: myapp
 | Tool | Version | Install |
 |------|---------|---------|
 | `docker` | 24+ | [docs.docker.com](https://docs.docker.com/get-docker/) |
-| `yq` (mikefarah) | v4+ | [github.com/mikefarah/yq](https://github.com/mikefarah/yq/releases) |
+| `yq` (mikefarah) | v4+ | macOS: `brew install yq` · Arch: [`go-yq`](https://archlinux.org/packages/extra/x86_64/go-yq/) · other: [github.com/mikefarah/yq](https://github.com/mikefarah/yq/releases) |
 
 > The Python `yq` package is **not** compatible. Install the Go binary from mikefarah.
 
