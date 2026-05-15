@@ -34,19 +34,19 @@ Stack: myapp
 **One-liner** (installs to `~/.local/bin/swarmfile`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/swarmfile/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bodav/swarmfile/main/install.sh | sh
 ```
 
 Override the install directory:
 
 ```sh
-SWARMFILE_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/swarmfile/main/install.sh | sh
+SWARMFILE_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/bodav/swarmfile/main/install.sh | sh
 ```
 
 **Manual** (run directly from a clone):
 
 ```bash
-git clone https://github.com/YOUR_ORG/swarmfile
+git clone https://github.com/bodav/swarmfile
 cd swarmfile
 ./swarmfile --help
 ```
