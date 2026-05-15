@@ -3,6 +3,9 @@
 # Usage: swarmfile [diff|apply] [flags]
 set -euo pipefail
 
+VERSION="0.1.0"
+SWARMFILE_REPO="bodav/swarmfile"
+
 # ─── Color helpers ────────────────────────────────────────────────────────────
 # Respects NO_COLOR env var and non-TTY stdout
 _setup_colors() {
@@ -65,15 +68,16 @@ COMMAND=""
 
 usage() {
   cat <<EOF
-${BOLD}swarmfile${RESET} — helmfile-style deploy manager for Docker Swarm
+${BOLD}swarmfile v${VERSION}${RESET} — helmfile-style deploy manager for Docker Swarm
 
 ${BOLD}USAGE${RESET}
   swarmfile <command> [flags]
 
 ${BOLD}COMMANDS${RESET}
-  init    Bootstrap a swarmfile.yaml in the current directory
-  diff    Show changes between swarmfile.yaml and running Docker stacks
-  apply   Apply changes; use --interactive to confirm before each deployment
+  init      Bootstrap a swarmfile.yaml in the current directory
+  diff      Show changes between swarmfile.yaml and running Docker stacks
+  apply     Apply changes; use --interactive to confirm before each deployment
+  version   Print version information
 
 ${BOLD}FLAGS${RESET}
   -f, --file FILE          Path to swarmfile.yaml (default: ./swarmfile.yaml)
@@ -107,12 +111,21 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
+      version)
+        echo "swarmfile v${VERSION}"
+        exit 0
+        ;;
       init|diff|apply)
         if [[ -n "$COMMAND" ]]; then
           fatal "Multiple commands specified: '${COMMAND}' and '${1}'"
         fi
         COMMAND="$1"
         shift
+        ;;
+
+      -v|--version)
+        echo "swarmfile v${VERSION}"
+        exit 0
         ;;
       -f|--file)
         [[ $# -lt 2 ]] && fatal "--file requires an argument"
