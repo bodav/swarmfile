@@ -31,14 +31,22 @@ Stack: myapp
 
 ## Installation
 
-Copy the `swarmfile` script somewhere on your `$PATH`:
+**One-liner** (installs to `~/.local/bin/swarmfile`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/swarmfile/main/install.sh | sh
+```
+
+Override the install directory:
+
+```sh
+SWARMFILE_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/swarmfile/main/install.sh | sh
+```
+
+**Manual** (run directly from a clone):
 
 ```bash
-# Option A — copy to a local bin directory
-cp swarmfile ~/.local/bin/swarmfile
-
-# Option B — run directly from a clone
-git clone https://github.com/yourorg/swarmfile
+git clone https://github.com/YOUR_ORG/swarmfile
 cd swarmfile
 ./swarmfile --help
 ```
