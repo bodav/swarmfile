@@ -105,7 +105,10 @@ swarmfile diff --file path/to/swarmfile.yaml
 - Exits **1** — changes detected (useful in CI to gate a deploy step)
 
 Per-service output:
-- `~ name` — service has changes (image / replicas / env vars shown)
+- `~ name` — service has changes; per-field diff lines show:
+  - **image** — compares compose `image:` (e.g. `nginx:1.27`) vs running image tag (SHA256 digest stripped automatically)
+  - **replicas** — compares compose `deploy.replicas` (default: `1`) vs running replica count
+  - **env** — compares environment variables as sorted `KEY=VALUE` pairs; added/removed entries shown with `+`/`-`
 - `+ name` — new service or new stack
 - `- name` — service will be removed on next apply (due to `--prune`)
 - `= name` — unchanged
